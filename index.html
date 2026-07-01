@@ -208,6 +208,10 @@
   </div>
 
   <div id="statusBox"></div>
+  <details id="debugPanel" style="margin-bottom:14px;font-size:12px;color:var(--ink-soft)">
+    <summary style="cursor:pointer;font-weight:600">除錯資訊(掃描原始字串)</summary>
+    <div id="debugContent" style="margin-top:8px;white-space:pre-wrap;word-break:break-all;background:var(--paper);border:1px dashed var(--line);border-radius:6px;padding:8px;font-family:var(--mono)"></div>
+  </details>
 
   <!-- 解析/輸入結果 -->
   <div class="receipt" id="resultBox" style="display:none">
@@ -265,7 +269,8 @@ function getGasUrl(){ return gasUrlInput.value.trim(); }
 
 // ========== LIFF 設定與初始化 ==========
 const liffIdInput = document.getElementById('liffId');
-liffIdInput.value = localStorage.getItem('liffId') || '';
+const DEFAULT_LIFF_ID = '2010566863-J17n9GqL'; // 你的 LIFF App,已內建,不用手動輸入
+liffIdInput.value = localStorage.getItem('liffId') || DEFAULT_LIFF_ID;
 liffIdInput.addEventListener('change', () => {
   localStorage.setItem('liffId', liffIdInput.value.trim());
   initLiff();
@@ -318,6 +323,27 @@ document.querySelectorAll('.tab').forEach(tab => {
 // 固定 77 碼: 發票號碼(10) + 發票日期(7,民國年) + 隨機碼(4) + 銷售額hex(8) + 總計額hex(8)
 //            + 買方統編(8) + 賣方統編(8) + 加密驗證資訊(24)
 // 之後以 ":" 分隔: 營業人自用區(10) : 條碼內品目筆數 : 該發票品目總筆數 : 中文編碼參數 : 品名:數量:單價 (重複)
+// 若原始位元組是 Big5,但解碼器(jsQR / LINE 掃描器)預設當 UTF-8 解讀,中文會變亂碼。
+// 位元組本身沒遺失,只是解讀方式錯了,實測發現有兩種可能的錯誤路徑,要先判斷是哪一種:
+// 路徑A:解碼器把每個位元組硬轉成對應碼位(0-255,類似 Latin1),沒有真的按 UTF-8 規則合併多位元組
+//        → 亂碼字元全部落在 0-255 範圍內,直接把每個字元的碼位當位元組值,重新用 Big5 解碼
+// 路徑B:位元組剛好能通過 UTF-8 合法性檢查,解碼器真的把它們合併成多位元組 Unicode 字元
+//        → 亂碼字元會出現超過 0xFF 的碼位(例如注音符號),要先重新編碼回 UTF-8 位元組,再用 Big5 解碼
+function fixBig5(str) {
+  const hasMultibyte = [...str].some(ch => ch.codePointAt(0) > 0xFF);
+  try {
+    if (hasMultibyte) {
+      const bytes = new TextEncoder().encode(str);
+      return new TextDecoder('big5').decode(bytes);
+    } else {
+      const bytes = Uint8Array.from([...str].map(c => c.charCodeAt(0) & 0xff));
+      return new TextDecoder('big5').decode(bytes);
+    }
+  } catch (e) {
+    return str; // 瀏覽器不支援 big5 解碼器,或還原失敗時,原樣返回,不讓程式壞掉
+  }
+}
+
 function parseLeftQR(raw) {
   if (!raw || raw.length < 77) throw new Error('左方 QR Code 內容長度不足,可能掃描到錯誤區塊');
 
@@ -339,10 +365,19 @@ function parseLeftQR(raw) {
   const totalAmount = parseInt(totalHex, 16) || 0;
 
   const rest = raw.slice(77); // 從第78碼開始, 以 ":" 起頭
-  const parts = rest.split(':').filter((_, i) => i > 0 || rest[0] !== ':'); // 去掉開頭空字串
-  const cleanParts = rest.startsWith(':') ? rest.slice(1).split(':') : rest.split(':');
+  let cleanParts = rest.startsWith(':') ? rest.slice(1).split(':') : rest.split(':');
 
   // cleanParts: [自用區, 條碼品目筆數, 該發票品目總筆數, 中文編碼參數, 品名, 數量, 單價, 品名, 數量, 單價, ...]
+  const itemCountInQr = parseInt(cleanParts[1], 10);
+  const itemCountTotal = parseInt(cleanParts[2], 10);
+  const encoding = cleanParts[3]; // '0'=Big5 '1'=UTF-8 '2'=Base64
+
+  if (encoding === '0') {
+    // 品名是 Big5,重新用正確編碼解一次,再重新切分欄位(數字/冒號在 Big5 底下跟 ASCII 完全相容,位置不會跑掉)
+    const fixedRest = fixBig5(rest);
+    cleanParts = fixedRest.startsWith(':') ? fixedRest.slice(1).split(':') : fixedRest.split(':');
+  }
+
   const items = [];
   if (cleanParts.length > 4) {
     for (let i = 4; i + 2 < cleanParts.length + 1 && cleanParts[i] !== undefined; i += 3) {
@@ -356,14 +391,19 @@ function parseLeftQR(raw) {
 
   return {
     invoiceNumber, randomCode, buyerId, sellerId,
-    date: isoDate, salesAmount, totalAmount, items
+    date: isoDate, salesAmount, totalAmount, items,
+    itemCountInQr: isNaN(itemCountInQr) ? null : itemCountInQr,
+    itemCountTotal: isNaN(itemCountTotal) ? null : itemCountTotal,
+    encoding
   };
 }
 
 // 右方 QR Code:前兩碼固定 "**",之後接續品名:數量:單價 三碼一組
-function parseRightQR(raw) {
+// 右方本身不重複記載中文編碼參數,沿用左方 QR 判斷出的編碼方式(呼叫時傳入)
+function parseRightQR(raw, encoding) {
   if (!raw || !raw.startsWith('**')) throw new Error('右方 QR Code 應以 ** 開頭,請確認掃到的是右側條碼');
-  const rest = raw.slice(2).replace(/^:/, '');
+  let rest = raw.slice(2).replace(/^:/, '');
+  if (encoding === '0') rest = fixBig5(rest);
   const parts = rest.split(':');
   const items = [];
   for (let i = 0; i + 2 < parts.length + 1 && parts[i] !== undefined; i += 3) {
@@ -430,6 +470,7 @@ document.getElementById('startCamBtn').addEventListener('click', startCamera);
 document.getElementById('stopCamBtn').addEventListener('click', stopCamera);
 
 function handleDecodedText(text) {
+  logDebug(text);
   // 右方 QR Code 固定以 "**" 開頭,不管目前是不是在等右方,只要看到這個開頭就當品項補充處理
   const looksLikeRightQr = text.startsWith('**');
 
@@ -437,7 +478,14 @@ function handleDecodedText(text) {
     try {
       const parsed = parseLeftQR(text);
       fillResultFromLeft(parsed);
-      showStatus('已讀取左側 QR Code,請核對資料(品項較多可再掃一次右側補上)', 'ok');
+      logDebug(text, `品目筆數(左右合計)=${parsed.itemCountInQr} / 發票交易總品目筆數=${parsed.itemCountTotal} / 本次解出品項數=${parsed.items.length} / 中文編碼=${parsed.encoding}(0=Big5 1=UTF-8 2=Base64)`);
+      if (parsed.itemCountTotal === 0 || parsed.itemCountTotal === null) {
+        showStatus('已讀取發票基本資料(號碼/日期/金額),這張發票的 QR Code 未編碼品項明細,請在下方手動新增品項', 'ok');
+      } else if (parsed.items.length < parsed.itemCountTotal) {
+        showStatus(`已讀取左側 QR Code,共 ${parsed.itemCountTotal} 項品項,目前解出 ${parsed.items.length} 項,請掃右側 QR Code 補齊`, 'ok');
+      } else {
+        showStatus('已讀取左側 QR Code,品項已完整,請核對資料', 'ok');
+      }
       document.getElementById('scanHint').textContent = '若有品項未讀完,可繼續對準右側 QR Code(選填)';
       awaitingRight = true;
     } catch (err) {
@@ -445,7 +493,7 @@ function handleDecodedText(text) {
     }
   } else {
     try {
-      const items = parseRightQR(text);
+      const items = parseRightQR(text, currentResult ? currentResult.encoding : undefined);
       appendItems(items);
       showStatus('已補上右側 QR Code 的品項', 'ok');
     } catch (err) {
@@ -495,7 +543,7 @@ document.getElementById('uploadRight').addEventListener('change', async (e) => {
   if (!file) return;
   try {
     const text = await decodeImageFile(file);
-    const items = parseRightQR(text);
+    const items = parseRightQR(text, currentResult ? currentResult.encoding : undefined);
     appendItems(items);
     showStatus('已補上右側 QR Code 的品項', 'ok');
   } catch (err) {
@@ -528,7 +576,10 @@ function fillResultFromLeft(parsed) {
     totalAmount: parsed.totalAmount,
     salesAmount: parsed.salesAmount,
     items: parsed.items,
-    source: 'QrScan'
+    source: 'QrScan',
+    itemCountInQr: parsed.itemCountInQr,
+    itemCountTotal: parsed.itemCountTotal,
+    encoding: parsed.encoding
   };
   renderResult();
 }
@@ -633,6 +684,17 @@ function showStatus(msg, type) {
 
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+let debugLog = [];
+function logDebug(text, extra) {
+  const time = new Date().toLocaleTimeString();
+  let entry = `[${time}] 原始字串(${text.length}碼):\n${text}`;
+  if (extra) entry += `\n→ ${extra}`;
+  debugLog.unshift(entry);
+  debugLog = debugLog.slice(0, 5);
+  document.getElementById('debugContent').textContent = debugLog.join('\n\n');
+  document.getElementById('debugPanel').open = true;
 }
 </script>
 </body>
